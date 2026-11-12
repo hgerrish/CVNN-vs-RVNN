@@ -1,4 +1,5 @@
 import glob
+import importlib.util
 import json
 import os
 import re
@@ -9,8 +10,22 @@ import torch
 import matplotlib.pyplot as plt
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-from GravLensCV_cnn import GravLensComplexCNN, ComplexConv2d, ComplexLinear, CRELU, ComplexAvgPool2d, ComplexAdaptiveAvgPool2d, ComplexBatchNorm
+
+# Load GravLens-cvnn.py cleanly despite the hyphen in the filename
+script_dir = os.path.dirname(os.path.abspath(__file__))
+module_path = os.path.join(script_dir, "GravLens-cvnn.py")
+spec = importlib.util.spec_from_file_location("GravLens_cvnn", module_path)
+cvnn_mod = importlib.util.module_from_spec(spec)
+sys.modules["GravLens_cvnn"] = cvnn_mod
+spec.loader.exec_module(cvnn_mod)
+
+GravLensComplexCNN = cvnn_mod.GravLensComplexCNN
+ComplexConv2d = cvnn_mod.ComplexConv2d
+ComplexLinear = cvnn_mod.ComplexLinear
+CRELU = cvnn_mod.CRELU
+ComplexAvgPool2d = cvnn_mod.ComplexAvgPool2d
+ComplexAdaptiveAvgPool2d = cvnn_mod.ComplexAdaptiveAvgPool2d
+ComplexBatchNorm = cvnn_mod.ComplexBatchNorm
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
@@ -20,7 +35,7 @@ def find_best_model(save_dir="saved_models/lens_cv"):
     files = glob.glob(os.path.join(save_dir, "lens_cv_model-*.pth"))
     if not files:
         raise FileNotFoundError(
-            f"No trained models found in '{save_dir}/'. Run GravLensCV_cnn.py first to train the model."
+            f"No trained models found in '{save_dir}/'. Run GravLens-cvnn.py first to train the model."
         )
     def loss_from_name(p):
         m = re.search(r"vloss-([0-9eE+\-.]+)\.pth$", p)
@@ -84,3 +99,4 @@ plt.tight_layout()
 out_path = "results/gravlens_cv_scatter.png"
 plt.savefig(out_path, dpi=150)
 print(f"\nSaved scatter plot to {out_path}")
+
