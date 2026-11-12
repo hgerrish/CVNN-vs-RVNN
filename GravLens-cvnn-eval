@@ -11,9 +11,9 @@ import matplotlib.pyplot as plt
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
-# Load GravLens-cvnn.py cleanly despite the hyphen in the filename
+# Load GravLens-cvnn cleanly despite the hyphen in the filename
 script_dir = os.path.dirname(os.path.abspath(__file__))
-module_path = os.path.join(script_dir, "GravLens-cvnn.py")
+module_path = os.path.join(script_dir, "GravLens-cvnn")
 spec = importlib.util.spec_from_file_location("GravLens_cvnn", module_path)
 cvnn_mod = importlib.util.module_from_spec(spec)
 sys.modules["GravLens_cvnn"] = cvnn_mod
@@ -35,7 +35,7 @@ def find_best_model(save_dir="saved_models/lens_cv"):
     files = glob.glob(os.path.join(save_dir, "lens_cv_model-*.pth"))
     if not files:
         raise FileNotFoundError(
-            f"No trained models found in '{save_dir}/'. Run GravLens-cvnn.py first to train the model."
+            f"No trained models found in '{save_dir}/'. Run GravLens-cvnn first to train the model."
         )
     def loss_from_name(p):
         m = re.search(r"vloss-([0-9eE+\-.]+)\.pth$", p)
