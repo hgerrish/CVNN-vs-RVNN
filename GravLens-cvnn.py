@@ -25,6 +25,41 @@ def log_history(path, row):
 
 NUM_PARAMS = 4  # theta_E, f, eps_x, eps_y
 
+def get_next_run_dir(base_dir="results", prefix="run"):
+    """Find the next available numbered run folder (e.g., results/run_1, results/run_2)."""
+    os.makedirs(base_dir, exist_ok=True)
+    existing = [
+        d for d in os.listdir(base_dir)
+        if os.path.isdir(os.path.join(base_dir, d)) and d.startswith(f"{prefix}_")
+    ]
+    run_nums = []
+    for d in existing:
+        try:
+            run_nums.append(int(d.split("_")[-1]))
+        except ValueError:
+            pass
+    next_num = max(run_nums, default=0) + 1
+    run_dir = os.path.join(base_dir, f"{prefix}_{next_num}")
+    os.makedirs(run_dir, exist_ok=True)
+    return run_dir, next_num
+
+
+def save_run_summary(run_dir, run_num, epoch_times, extra_metrics=None):
+    """Save average epoch time and run metadata to summary.csv."""
+    avg_time = sum(epoch_times) / len(epoch_times) if epoch_times else 0.0
+    summary_path = os.path.join(run_dir, "summary.csv")
+    row = {
+        "run": run_num,
+        "num_epochs": len(epoch_times),
+        "avg_epoch_time_sec": round(avg_time, 4),
+        "total_time_sec": round(sum(epoch_times), 4),
+    }
+    if extra_metrics:
+        row.update(extra_metrics)
+    log_history(summary_path, row)
+    print(f"Run {run_num} complete | Avg epoch time: {avg_time:.4f}s | Saved to {run_dir}")
+
+
 
 ### Complex conv/linear layers (same real+imag weight-pair pattern used
 ### throughout the project's other CVNN scripts)
@@ -229,10 +264,9 @@ def evaluate(model, X, y, batch_size=128):
 
 
 def train_model(model, train_X, train_y, val_X, val_y, epochs, lr,
-                 batch_size=64, save_dir="saved_models/lens_cv",
-                 start_epoch=0, best_vloss=float("inf"),
-                 history_path="results/lens_cv_loss_history.csv",
-                 ckpt_prefix="lens_cv_model"):
+                batch_size=64, save_dir="saved_models/lens_cv",
+                start_epoch=0, best_vloss=float("inf"),
+                ckpt_prefix="lens_cv_model"):
     os.makedirs(save_dir, exist_ok=True)
     model = model.to(device)
     optimizer = optim.Adam(model.parameters(), lr=lr)
@@ -241,11 +275,20 @@ def train_model(model, train_X, train_y, val_X, val_y, epochs, lr,
     n = len(train_X)
     total_epochs = start_epoch + epochs
 
+    # Create a new numbered folder for this run (e.g., results/run_1)
+    run_dir, run_num = get_next_run_dir(base_dir="results", prefix="run")
+    history_path = os.path.join(run_dir, "loss_history.csv")
+    epoch_times = []
+    print(f"Starting Run {run_num} -> saving outputs to {run_dir}")
+
     for epoch in range(start_epoch, total_epochs):
         model.train()
         perm = torch.randperm(n)
         total_loss = 0.0
-        t0 = time.time()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
+
         for i in range(0, n, batch_size):
             idx = perm[i:i + batch_size]
             xb = train_X[idx].to(device)
@@ -262,11 +305,19 @@ def train_model(model, train_X, train_y, val_X, val_y, epochs, lr,
         train_loss = total_loss / n
         val_loss = evaluate(model, val_X, val_y)
 
-        print(f"Epoch {epoch+1}/{total_epochs} ({time.time()-t0:.1f}s) "
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        epoch_duration = time.perf_counter() - t0
+        epoch_times.append(epoch_duration)
+
+        print(f"Epoch {epoch+1}/{total_epochs} ({epoch_duration:.1f}s) "
               f"train_loss={train_loss:.4e} val_loss={val_loss:.4e}")
 
         log_history(history_path, {
-            "epoch": epoch + 1, "train_loss": train_loss, "val_loss": val_loss,
+            "epoch": epoch + 1,
+            "train_loss": train_loss,
+            "val_loss": val_loss,
+            "epoch_time_sec": round(epoch_duration, 4),
         })
 
         if val_loss < best_vloss:
@@ -275,36 +326,5 @@ def train_model(model, train_X, train_y, val_X, val_y, epochs, lr,
             torch.save(model, fname)
             print(f"  Saved new best model: {fname}")
 
-
-if __name__ == "__main__":
-    DATA_DIR = "prepped_data/lens_cv"
-    train_X = torch.from_numpy(np.load(os.path.join(DATA_DIR, "train_X.npy"))).to(torch.complex64)
-    train_y = torch.from_numpy(np.load(os.path.join(DATA_DIR, "train_y.npy"))).to(torch.float32)
-    val_X = torch.from_numpy(np.load(os.path.join(DATA_DIR, "val_X.npy"))).to(torch.complex64)
-    val_y = torch.from_numpy(np.load(os.path.join(DATA_DIR, "val_y.npy"))).to(torch.float32)
-
-    print("train_X shape:", train_X.shape, "val_X shape:", val_X.shape)
-
-    SAVE_DIR = "saved_models/lens_cv"
-    import glob, re
-    existing = glob.glob(os.path.join(SAVE_DIR, "lens_cv_model-*.pth"))
-    if existing:
-        def epoch_from_name(p):
-            m = re.search(r"model-(\d+)-", p)
-            return int(m.group(1)) if m else -1
-        def vloss_from_name(p):
-            m = re.search(r"vloss-([0-9eE+\-.]+)\.pth$", p)
-            return float(m.group(1)) if m else float("inf")
-        latest = max(existing, key=epoch_from_name)
-        print(f"Resuming from {latest}")
-        model = torch.load(latest, map_location=device, weights_only=False)
-        start_epoch = epoch_from_name(latest)
-        best_vloss = vloss_from_name(latest)
-    else:
-        model = GravLensComplexCNN()
-        start_epoch = 0
-        best_vloss = float("inf")
-    print("Model has", sum(p.numel() for p in model.parameters() if p.requires_grad), "trainable parameters.")
-
-    train_model(model, train_X, train_y, val_X, val_y, epochs=500, lr=0.001,
-                save_dir=SAVE_DIR, start_epoch=start_epoch, best_vloss=best_vloss)
+    # Save average epoch runtime after all epochs finish
+    save_run_summary(run_dir, run_num, epoch_times, extra_metrics={"best_val_loss": best_vloss})
