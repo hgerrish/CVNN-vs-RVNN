@@ -7,10 +7,11 @@ import sys
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
+from GravLens_rvnn_base import GravLensRealCNN
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-from GravLens-rvnn-base import GravLensRealCNN
+
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
@@ -20,7 +21,7 @@ def find_best_model(save_dir="saved_models/lens_rv"):
     files = glob.glob(os.path.join(save_dir, "lens_rv_model-*.pth"))
     if not files:
         raise FileNotFoundError(
-            f"No trained models found in '{save_dir}/'. Run GravLens-rvnn-base.py first to train the model."
+            f"No trained models found in '{save_dir}/'. Run GravLens_rvnn_base.py first to train the model."
         )
     def loss_from_name(p):
         m = re.search(r"vloss-([0-9eE+\-.]+)\.pth$", p)
