@@ -22,6 +22,41 @@ def log_history(path, row):
         writer.writerow(row)
 
 
+def get_next_run_dir(base_dir="results", prefix="rv_fft_run"):
+    """Find the next available numbered run folder (e.g., results/rv_fft_run_1)."""
+    os.makedirs(base_dir, exist_ok=True)
+    existing = [
+        d for d in os.listdir(base_dir)
+        if os.path.isdir(os.path.join(base_dir, d)) and d.startswith(f"{prefix}_")
+    ]
+    run_nums = []
+    for d in existing:
+        try:
+            run_nums.append(int(d.split("_")[-1]))
+        except ValueError:
+            pass
+    next_num = max(run_nums, default=0) + 1
+    run_dir = os.path.join(base_dir, f"{prefix}_{next_num}")
+    os.makedirs(run_dir, exist_ok=True)
+    return run_dir, next_num
+
+
+def save_run_summary(run_dir, run_num, epoch_times, extra_metrics=None):
+    """Save average epoch time and run metadata to summary.csv."""
+    avg_time = sum(epoch_times) / len(epoch_times) if epoch_times else 0.0
+    summary_path = os.path.join(run_dir, "summary.csv")
+    row = {
+        "run": run_num,
+        "num_epochs": len(epoch_times),
+        "avg_epoch_time_sec": round(avg_time, 4),
+        "total_time_sec": round(sum(epoch_times), 4),
+    }
+    if extra_metrics:
+        row.update(extra_metrics)
+    log_history(summary_path, row)
+    print(f"Run {run_num} complete | Avg epoch time: {avg_time:.4f}s | Saved to {run_dir}")
+
+
 def to_centered_fft_channels(x):
     """Convert (N, 1, H, W) real images into (N, 2, H, W) centered 2D FFT [real, imag]."""
     # Compute 2D FFT over spatial dims and shift zero-frequency component to center
@@ -91,11 +126,20 @@ def train_model(model, train_X, train_y, val_X, val_y, epochs, lr,
     best_vloss = float("inf")
     n = len(train_X)
 
+    # Create a new numbered folder for this run (e.g., results/rv_fft_run_1)
+    run_dir, run_num = get_next_run_dir(base_dir="results", prefix="rv_fft_run")
+    history_path = os.path.join(run_dir, "loss_history.csv")
+    epoch_times = []
+    print(f"Starting Run {run_num} -> saving outputs to {run_dir}")
+
     for epoch in range(epochs):
         model.train()
         perm = torch.randperm(n)
         total_loss = 0.0
-        t0 = time.time()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
+
         for i in range(0, n, batch_size):
             idx = perm[i:i + batch_size]
             xb = train_X[idx].to(device)
@@ -112,11 +156,19 @@ def train_model(model, train_X, train_y, val_X, val_y, epochs, lr,
         train_loss = total_loss / n
         val_loss = evaluate(model, val_X, val_y)
 
-        print(f"Epoch {epoch+1}/{epochs} ({time.time()-t0:.1f}s) "
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        epoch_duration = time.perf_counter() - t0
+        epoch_times.append(epoch_duration)
+
+        print(f"Epoch {epoch+1}/{epochs} ({epoch_duration:.1f}s) "
               f"train_loss={train_loss:.4e} val_loss={val_loss:.4e}")
 
-        log_history("results/lens_rv_fft_loss_history.csv", {
-            "epoch": epoch + 1, "train_loss": train_loss, "val_loss": val_loss,
+        log_history(history_path, {
+            "epoch": epoch + 1,
+            "train_loss": train_loss,
+            "val_loss": val_loss,
+            "epoch_time_sec": round(epoch_duration, 4),
         })
 
         if val_loss < best_vloss:
@@ -124,6 +176,9 @@ def train_model(model, train_X, train_y, val_X, val_y, epochs, lr,
             fname = f"{save_dir}/lens_rv_fft_model-{epoch+1:04d}-vloss-{val_loss:.4e}.pth"
             torch.save(model, fname)
             print(f"  Saved new best model: {fname}")
+
+    # Save average epoch runtime after all epochs finish
+    save_run_summary(run_dir, run_num, epoch_times, extra_metrics={"best_val_loss": best_vloss})
 
 
 if __name__ == "__main__":
@@ -143,3 +198,4 @@ if __name__ == "__main__":
     print("Model has", sum(p.numel() for p in model.parameters() if p.requires_grad), "trainable parameters.")
 
     train_model(model, train_X, train_y, val_X, val_y, epochs=500, lr=0.001)
+
