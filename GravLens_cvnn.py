@@ -328,3 +328,23 @@ def train_model(model, train_X, train_y, val_X, val_y, epochs, lr,
 
     # Save average epoch runtime after all epochs finish
     save_run_summary(run_dir, run_num, epoch_times, extra_metrics={"best_val_loss": best_vloss})
+
+if __name__ == "__main__":
+    # Load prepped data (update filenames if saved as .npy or a single .pt dict)
+    train_X = torch.load("prepped_data/lens_cv/train_X.pt")
+    train_y = torch.load("prepped_data/lens_cv/train_y.pt")
+    val_X = torch.load("prepped_data/lens_cv/val_X.pt")
+    val_y = torch.load("prepped_data/lens_cv/val_y.pt")
+
+    model = GravLensComplexCNN()
+
+    train_model(
+        model=model,
+        train_X=train_X,
+        train_y=train_y,
+        val_X=val_X,
+        val_y=val_y,
+        epochs=500,
+        lr=1e-3,
+        batch_size=64,
+    )
