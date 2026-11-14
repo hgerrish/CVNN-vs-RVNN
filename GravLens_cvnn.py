@@ -330,13 +330,23 @@ def train_model(model, train_X, train_y, val_X, val_y, epochs, lr,
     save_run_summary(run_dir, run_num, epoch_times, extra_metrics={"best_val_loss": best_vloss})
 
 if __name__ == "__main__":
-    # Load prepped data (update filenames if saved as .npy or a single .pt dict)
-    train_X = torch.load("prepped_data/lens_cv/train_X.pt")
-    train_y = torch.load("prepped_data/lens_cv/train_y.pt")
-    val_X = torch.load("prepped_data/lens_cv/val_X.pt")
-    val_y = torch.load("prepped_data/lens_cv/val_y.pt")
+    import json
+    import numpy as np
 
-    model = GravLensComplexCNN()
+    data_dir = "prepped_data/lens_cv"
+
+    # Load the complex64 FFT inputs and float32 normalized labels saved by data-prep.py
+    train_X = torch.from_numpy(np.load(os.path.join(data_dir, "train_X.npy")))
+    train_y = torch.from_numpy(np.load(os.path.join(data_dir, "train_y.npy")))
+    val_X = torch.from_numpy(np.load(os.path.join(data_dir, "val_X.npy")))
+    val_y = torch.from_numpy(np.load(os.path.join(data_dir, "val_y.npy")))
+
+    # Read num_params dynamically from lens_scaler.json (4 parameters: theta_E, f, eps_x, eps_y)
+    with open("prepped_data/lens_scaler.json", "r") as f:
+        scaler = json.load(f)
+    num_params = len(scaler["param_names"])
+
+    model = GravLensComplexCNN(num_params=num_params)
 
     train_model(
         model=model,
@@ -347,4 +357,6 @@ if __name__ == "__main__":
         epochs=500,
         lr=1e-3,
         batch_size=64,
+        save_dir="saved_models/lens_cv",
+        ckpt_prefix="lens_cv_model",
     )
