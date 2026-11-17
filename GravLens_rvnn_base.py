@@ -1,5 +1,9 @@
 import csv
+import json
 import os
+import platform
+import random
+import subprocess
 import time
 
 import numpy as np
@@ -11,6 +15,43 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
 
+def set_seed(seed):
+    """Set all random seeds for reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def get_git_hash():
+    """Retrieve the current Git commit hash."""
+    try:
+        return subprocess.check_output(["git", "rev-parse", "HEAD"]).decode("utf-8").strip()
+    except Exception:
+        return "not-a-git-repo"
+
+
+def save_metadata(run_dir, run_num, seed):
+    """Save exact seed, hardware config, and commit hash to metadata.json."""
+    metadata = {
+        "run": run_num,
+        "model_type": "GravLensRealCNN_Pixel",
+        "seed": seed,
+        "git_commit_hash": get_git_hash(),
+        "hardware": {
+            "device": str(device),
+            "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "None",
+            "cpu": platform.processor() or platform.machine(),
+            "os": platform.platform(),
+            "pytorch_version": torch.__version__,
+        }
+    }
+    meta_path = os.path.join(run_dir, "metadata.json")
+    with open(meta_path, "w") as f:
+        json.dump(metadata, f, indent=4)
+
+
 def log_history(path, row):
     """Append one epoch's metrics to a CSV loss-history file (writes header on first call)."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -20,6 +61,43 @@ def log_history(path, row):
         if is_new:
             writer.writeheader()
         writer.writerow(row)
+
+
+def get_next_run_dir(base_dir="results", prefix="rv_pixel_run"):
+    """Find the next available numbered run folder (e.g., results/rv_pixel_run_1)."""
+    os.makedirs(base_dir, exist_ok=True)
+    existing = [
+        d for d in os.listdir(base_dir)
+        if os.path.isdir(os.path.join(base_dir, d)) and d.startswith(f"{prefix}_")
+    ]
+    run_nums = []
+    for d in existing:
+        try:
+            run_nums.append(int(d.split("_")[-1]))
+        except ValueError:
+            pass
+    next_num = max(run_nums, default=0) + 1
+    run_dir = os.path.join(base_dir, f"{prefix}_{next_num}")
+    os.makedirs(run_dir, exist_ok=True)
+    return run_dir, next_num
+
+
+def save_run_summary(run_dir, run_num, seed, epoch_times, extra_metrics=None):
+    """Save average epoch time and run metadata to summary.csv."""
+    avg_time = sum(epoch_times) / len(epoch_times) if epoch_times else 0.0
+    summary_path = os.path.join(run_dir, "summary.csv")
+    row = {
+        "run": run_num,
+        "seed": seed,
+        "num_epochs": len(epoch_times),
+        "avg_epoch_time_sec": round(avg_time, 4),
+        "total_time_sec": round(sum(epoch_times), 4),
+    }
+    if extra_metrics:
+        row.update(extra_metrics)
+    log_history(summary_path, row)
+    print(f"Run {run_num} (Seed {seed}) complete | Avg epoch time: {avg_time:.4f}s | Saved to {run_dir}")
+
 
 NUM_PARAMS = 4  # theta_E, f, eps_x, eps_y
 
@@ -59,9 +137,8 @@ def evaluate(model, X, y, batch_size=128):
     return total_loss / (len(X) * y.shape[1])
 
 
-def train_model(model, train_X, train_y, val_X, val_y, epochs, lr,
-                 batch_size=64, save_dir="saved_models/lens_rv"):
-    os.makedirs(save_dir, exist_ok=True)
+def train_model(model, train_X, train_y, val_X, val_y, epochs, lr, seed,
+                batch_size=64, base_save_dir="saved_models/lens_rv"):
     model = model.to(device)
     optimizer = optim.Adam(model.parameters(), lr=lr)
     criterion = nn.MSELoss()
@@ -69,11 +146,28 @@ def train_model(model, train_X, train_y, val_X, val_y, epochs, lr,
     best_vloss = float("inf")
     n = len(train_X)
 
+    # Create a new numbered folder for this run (e.g., results/rv_pixel_run_1)
+    run_dir, run_num = get_next_run_dir(base_dir="results", prefix="rv_pixel_run")
+
+    # Save metadata.json immediately to verify seed, hardware, and git commit
+    save_metadata(run_dir, run_num, seed)
+
+    # Isolate model checkpoints per run/seed so trials don't overwrite each other
+    save_dir = os.path.join(base_save_dir, f"run_{run_num}_seed_{seed}")
+    os.makedirs(save_dir, exist_ok=True)
+
+    history_path = os.path.join(run_dir, "loss_history.csv")
+    epoch_times = []
+    print(f"\nStarting Run {run_num} (Seed {seed}) -> saving outputs to {run_dir}")
+
     for epoch in range(epochs):
         model.train()
         perm = torch.randperm(n)
         total_loss = 0.0
-        t0 = time.time()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
+
         for i in range(0, n, batch_size):
             idx = perm[i:i + batch_size]
             xb = train_X[idx].to(device)
@@ -90,11 +184,19 @@ def train_model(model, train_X, train_y, val_X, val_y, epochs, lr,
         train_loss = total_loss / n
         val_loss = evaluate(model, val_X, val_y)
 
-        print(f"Epoch {epoch+1}/{epochs} ({time.time()-t0:.1f}s) "
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        epoch_duration = time.perf_counter() - t0
+        epoch_times.append(epoch_duration)
+
+        print(f"[Seed {seed}] Epoch {epoch+1}/{epochs} ({epoch_duration:.1f}s) "
               f"train_loss={train_loss:.4e} val_loss={val_loss:.4e}")
 
-        log_history("results/lens_rv_loss_history.csv", {
-            "epoch": epoch + 1, "train_loss": train_loss, "val_loss": val_loss,
+        log_history(history_path, {
+            "epoch": epoch + 1,
+            "train_loss": train_loss,
+            "val_loss": val_loss,
+            "epoch_time_sec": round(epoch_duration, 4),
         })
 
         if val_loss < best_vloss:
@@ -102,6 +204,8 @@ def train_model(model, train_X, train_y, val_X, val_y, epochs, lr,
             fname = f"{save_dir}/lens_rv_model-{epoch+1:04d}-vloss-{val_loss:.4e}.pth"
             torch.save(model, fname)
             print(f"  Saved new best model: {fname}")
+
+    save_run_summary(run_dir, run_num, seed, epoch_times, extra_metrics={"best_val_loss": best_vloss})
 
 
 if __name__ == "__main__":
@@ -113,7 +217,17 @@ if __name__ == "__main__":
 
     print("train_X shape:", train_X.shape, "val_X shape:", val_X.shape)
 
-    model = GravLensRealCNN()
-    print("Model has", sum(p.numel() for p in model.parameters() if p.requires_grad), "trainable parameters.")
+    SEEDS = [42, 123, 456, 789]
 
-    train_model(model, train_X, train_y, val_X, val_y, epochs=500, lr=0.001)
+    for seed in SEEDS:
+        # 1. Set the seed BEFORE initializing the model
+        set_seed(seed)
+
+        # 2. Initialize a fresh model from scratch for every trial
+        model = GravLensRealCNN()
+        if seed == SEEDS[0]:
+            print("Model has", sum(p.numel() for p in model.parameters() if p.requires_grad), "trainable parameters.")
+
+        # 3. Run training
+        train_model(model, train_X, train_y, val_X, val_y, epochs=500, lr=0.001, seed=seed)
+
