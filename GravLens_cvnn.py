@@ -1,6 +1,10 @@
 import csv
+import json
 import math
 import os
+import platform
+import random
+import subprocess
 import time
 
 import numpy as np
@@ -11,6 +15,45 @@ import torch.optim as optim
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
+
+NUM_PARAMS = 4  # theta_E, f, eps_x, eps_y
+
+
+def set_seed(seed):
+    """Set all random seeds for reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def get_git_hash():
+    """Retrieve the current Git commit hash."""
+    try:
+        return subprocess.check_output(["git", "rev-parse", "HEAD"]).decode("utf-8").strip()
+    except Exception:
+        return "not-a-git-repo"
+
+
+def save_metadata(run_dir, run_num, seed):
+    """Save exact seed, hardware config, and commit hash to metadata.json."""
+    metadata = {
+        "run": run_num,
+        "model_type": "GravLensComplexCNN_FFT",
+        "seed": seed,
+        "git_commit_hash": get_git_hash(),
+        "hardware": {
+            "device": str(device),
+            "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "None",
+            "cpu": platform.processor() or platform.machine(),
+            "os": platform.platform(),
+            "pytorch_version": torch.__version__,
+        }
+    }
+    meta_path = os.path.join(run_dir, "metadata.json")
+    with open(meta_path, "w") as f:
+        json.dump(metadata, f, indent=4)
 
 
 def log_history(path, row):
@@ -23,10 +66,9 @@ def log_history(path, row):
             writer.writeheader()
         writer.writerow(row)
 
-NUM_PARAMS = 4  # theta_E, f, eps_x, eps_y
 
-def get_next_run_dir(base_dir="results", prefix="run"):
-    """Find the next available numbered run folder (e.g., results/run_1, results/run_2)."""
+def get_next_run_dir(base_dir="results", prefix="cv_fft_run"):
+    """Find the next available numbered run folder (e.g., results/cv_fft_run_1)."""
     os.makedirs(base_dir, exist_ok=True)
     existing = [
         d for d in os.listdir(base_dir)
@@ -44,12 +86,13 @@ def get_next_run_dir(base_dir="results", prefix="run"):
     return run_dir, next_num
 
 
-def save_run_summary(run_dir, run_num, epoch_times, extra_metrics=None):
+def save_run_summary(run_dir, run_num, seed, epoch_times, extra_metrics=None):
     """Save average epoch time and run metadata to summary.csv."""
     avg_time = sum(epoch_times) / len(epoch_times) if epoch_times else 0.0
     summary_path = os.path.join(run_dir, "summary.csv")
     row = {
         "run": run_num,
+        "seed": seed,
         "num_epochs": len(epoch_times),
         "avg_epoch_time_sec": round(avg_time, 4),
         "total_time_sec": round(sum(epoch_times), 4),
@@ -57,12 +100,15 @@ def save_run_summary(run_dir, run_num, epoch_times, extra_metrics=None):
     if extra_metrics:
         row.update(extra_metrics)
     log_history(summary_path, row)
-    print(f"Run {run_num} complete | Avg epoch time: {avg_time:.4f}s | Saved to {run_dir}")
+    print(f"Run {run_num} (Seed {seed}) complete | Avg epoch time: {avg_time:.4f}s | Saved to {run_dir}")
 
 
+def to_centered_complex_fft(x):
+    """Convert (N, 1, H, W) real images into (N, 1, H, W) complex64 centered 2D FFT."""
+    fft_c = torch.fft.fftshift(torch.fft.fft2(x), dim=(-2, -1))
+    return fft_c.to(torch.complex64)
 
-### Complex conv/linear layers (same real+imag weight-pair pattern used
-### throughout the project's other CVNN scripts)
+
 class ComplexConv2d(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size, padding=0):
         super().__init__()
@@ -127,21 +173,7 @@ class ComplexAdaptiveAvgPool2d(nn.Module):
 
 
 class ComplexBatchNorm(nn.Module):
-    """Complex Batch Normalization (Trabelsi et al. 2018, "Deep Complex Networks").
-
-    Jointly whitens the real/imaginary parts per-channel using the inverse
-    square root of their 2x2 covariance matrix [[Vrr,Vri],[Vri,Vii]] (rather
-    than normalizing real/imag independently, which ignores their
-    correlation), then applies a learnable complex affine transform. This is
-    the standard fix for complex-valued networks whose activations collapse
-    toward zero (and die under ReLU) when the input magnitude is small or
-    varies a lot across examples -- exactly the failure mode diagnosed here,
-    where faint/small-theta_E lens images produced near-zero activations by
-    the second conv layer.
-
-    Set spatial=True for features after a ComplexConv2d (N,C,H,W), spatial=False
-    for features after a ComplexLinear (N,C).
-    """
+    """Complex Batch Normalization (Trabelsi et al. 2018, "Deep Complex Networks")."""
 
     def __init__(self, num_features, spatial=True, eps=1e-5, momentum=0.1):
         super().__init__()
@@ -149,8 +181,6 @@ class ComplexBatchNorm(nn.Module):
         self.eps = eps
         self.momentum = momentum
 
-        # Learnable 2x2 scale (gamma) + complex shift (beta), gamma initialized
-        # to 1/sqrt(2) on the diagonal so a fully-whitened input keeps unit variance.
         self.gamma_rr = nn.Parameter(torch.full((num_features,), 1.0 / math.sqrt(2)))
         self.gamma_ii = nn.Parameter(torch.full((num_features,), 1.0 / math.sqrt(2)))
         self.gamma_ri = nn.Parameter(torch.zeros(num_features))
@@ -193,8 +223,6 @@ class ComplexBatchNorm(nn.Module):
             xc = real - mean_r.view(*shape)
             yc = imag - mean_i.view(*shape)
 
-        # Inverse square root of the 2x2 covariance matrix (closed form for
-        # symmetric 2x2 matrices): tau = trace, delta = det.
         tau = Vrr + Vii
         delta = Vrr * Vii - Vri ** 2
         s = torch.sqrt(torch.clamp(delta, min=self.eps))
@@ -218,27 +246,19 @@ class ComplexBatchNorm(nn.Module):
         return torch.complex(out_real, out_imag)
 
 
-### CV-CNN regressor -- same conv/pool schedule as the RVNN counterpart,
-### operating on the image's centered 2D FFT (genuinely complex input)
 class GravLensComplexCNN(nn.Module):
     def __init__(self, num_params=NUM_PARAMS):
         super().__init__()
         self.features = nn.Sequential(
-            ComplexConv2d(1, 16, kernel_size=3, padding=1), ComplexBatchNorm(16, spatial=True), CRELU(), ComplexAvgPool2d(2),   # 64 -> 32
-            ComplexConv2d(16, 32, kernel_size=3, padding=1), ComplexBatchNorm(32, spatial=True), CRELU(), ComplexAvgPool2d(2),  # 32 -> 16
-            ComplexConv2d(32, 64, kernel_size=3, padding=1), ComplexBatchNorm(64, spatial=True), CRELU(), ComplexAvgPool2d(2),  # 16 -> 8
+            ComplexConv2d(1, 16, kernel_size=3, padding=1), ComplexBatchNorm(16, spatial=True), CRELU(), ComplexAvgPool2d(2),
+            ComplexConv2d(16, 32, kernel_size=3, padding=1), ComplexBatchNorm(32, spatial=True), CRELU(), ComplexAvgPool2d(2),
+            ComplexConv2d(32, 64, kernel_size=3, padding=1), ComplexBatchNorm(64, spatial=True), CRELU(), ComplexAvgPool2d(2),
         )
         self.pool = ComplexAdaptiveAvgPool2d(1)
         self.fc1 = ComplexLinear(64, 64)
         self.bn_fc1 = ComplexBatchNorm(64, spatial=False)
         self.act = CRELU()
         self.fc2 = ComplexLinear(64, num_params)
-        # Real-valued readout from the concatenated real+imag parts of fc2's
-        # output. NOTE: sigmoid(x.abs()) is WRONG here -- abs() is always
-        # >= 0 and sigmoid(0) = 0.5, so that combination can only ever
-        # produce outputs in [0.5, 1.0], never below 0.5. This readout lets
-        # the network learn any (possibly negative) combination of real/imag
-        # parts, so the full [0,1] sigmoid range is actually reachable.
         self.readout = nn.Linear(num_params * 2, num_params)
 
     def forward(self, x):
@@ -260,14 +280,13 @@ def evaluate(model, X, y, batch_size=128):
             yb = y[i:i + batch_size].to(device)
             pred = model(xb)
             total_loss += criterion(pred, yb).item()
-    return total_loss / (len(X) * y.shape[1])
+    return total_loss / (len(X) * y.shape)
 
 
-def train_model(model, train_X, train_y, val_X, val_y, epochs, lr,
-                batch_size=64, save_dir="saved_models/lens_cv",
+def train_model(model, train_X, train_y, val_X, val_y, epochs, lr, seed,
+                batch_size=64, base_save_dir="saved_models/lens_cv",
                 start_epoch=0, best_vloss=float("inf"),
                 ckpt_prefix="lens_cv_model"):
-    os.makedirs(save_dir, exist_ok=True)
     model = model.to(device)
     optimizer = optim.Adam(model.parameters(), lr=lr)
     criterion = nn.MSELoss()
@@ -275,11 +294,19 @@ def train_model(model, train_X, train_y, val_X, val_y, epochs, lr,
     n = len(train_X)
     total_epochs = start_epoch + epochs
 
-    # Create a new numbered folder for this run (e.g., results/run_1)
-    run_dir, run_num = get_next_run_dir(base_dir="results", prefix="run")
+    # Create a new numbered folder for this run (e.g., results/cv_fft_run_1)
+    run_dir, run_num = get_next_run_dir(base_dir="results", prefix="cv_fft_run")
+
+    # Save metadata.json immediately to verify seed, hardware, and git commit
+    save_metadata(run_dir, run_num, seed)
+
+    # Isolate model checkpoints per run/seed so trials don't overwrite each other
+    save_dir = os.path.join(base_save_dir, f"run_{run_num}_seed_{seed}")
+    os.makedirs(save_dir, exist_ok=True)
+
     history_path = os.path.join(run_dir, "loss_history.csv")
     epoch_times = []
-    print(f"Starting Run {run_num} -> saving outputs to {run_dir}")
+    print(f"\nStarting Run {run_num} (Seed {seed}) -> saving outputs to {run_dir}")
 
     for epoch in range(start_epoch, total_epochs):
         model.train()
@@ -310,7 +337,7 @@ def train_model(model, train_X, train_y, val_X, val_y, epochs, lr,
         epoch_duration = time.perf_counter() - t0
         epoch_times.append(epoch_duration)
 
-        print(f"Epoch {epoch+1}/{total_epochs} ({epoch_duration:.1f}s) "
+        print(f"[Seed {seed}] Epoch {epoch+1}/{total_epochs} ({epoch_duration:.1f}s) "
               f"train_loss={train_loss:.4e} val_loss={val_loss:.4e}")
 
         log_history(history_path, {
@@ -326,37 +353,26 @@ def train_model(model, train_X, train_y, val_X, val_y, epochs, lr,
             torch.save(model, fname)
             print(f"  Saved new best model: {fname}")
 
-    # Save average epoch runtime after all epochs finish
-    save_run_summary(run_dir, run_num, epoch_times, extra_metrics={"best_val_loss": best_vloss})
+    save_run_summary(run_dir, run_num, seed, epoch_times, extra_metrics={"best_val_loss": best_vloss})
+
 
 if __name__ == "__main__":
-    import json
-    import numpy as np
+    DATA_DIR = "prepped_data/lens_rv"
+    train_X_raw = torch.from_numpy(np.load(os.path.join(DATA_DIR, "train_X.npy"))).to(torch.float32)
+    train_y = torch.from_numpy(np.load(os.path.join(DATA_DIR, "train_y.npy"))).to(torch.float32)
+    val_X_raw = torch.from_numpy(np.load(os.path.join(DATA_DIR, "val_X.npy"))).to(torch.float32)
+    val_y = torch.from_numpy(np.load(os.path.join(DATA_DIR, "val_y.npy"))).to(torch.float32)
 
-    data_dir = "prepped_data/lens_cv"
+    train_X = to_centered_complex_fft(train_X_raw)
+    val_X = to_centered_complex_fft(val_X_raw)
+    print("train_X complex FFT shape:", train_X.shape, "val_X complex FFT shape:", val_X.shape)
 
-    # Load the complex64 FFT inputs and float32 normalized labels saved by data-prep.py
-    train_X = torch.from_numpy(np.load(os.path.join(data_dir, "train_X.npy")))
-    train_y = torch.from_numpy(np.load(os.path.join(data_dir, "train_y.npy")))
-    val_X = torch.from_numpy(np.load(os.path.join(data_dir, "val_X.npy")))
-    val_y = torch.from_numpy(np.load(os.path.join(data_dir, "val_y.npy")))
+    SEEDS =
 
-    # Read num_params dynamically from lens_scaler.json (4 parameters: theta_E, f, eps_x, eps_y)
-    with open("prepped_data/lens_scaler.json", "r") as f:
-        scaler = json.load(f)
-    num_params = len(scaler["param_names"])
+    for seed in SEEDS:
+        set_seed(seed)
+        model = GravLensComplexCNN()
+        if seed == SEEDS:
+            print("Model has", sum(p.numel() for p in model.parameters() if p.requires_grad), "trainable parameters.")
 
-    model = GravLensComplexCNN(num_params=num_params)
-
-    train_model(
-        model=model,
-        train_X=train_X,
-        train_y=train_y,
-        val_X=val_X,
-        val_y=val_y,
-        epochs=500,
-        lr=1e-3,
-        batch_size=64,
-        save_dir="saved_models/lens_cv",
-        ckpt_prefix="lens_cv_model",
-    )
+        train_model(model, train_X, train_y, val_X, val_y, epochs=500, lr=0.001, seed=seed)
