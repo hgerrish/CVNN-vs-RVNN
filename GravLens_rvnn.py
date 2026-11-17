@@ -1,5 +1,9 @@
 import csv
+import json
 import os
+import platform
+import random
+import subprocess
 import time
 
 import numpy as np
@@ -9,6 +13,42 @@ import torch.optim as optim
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
+
+
+def set_seed(seed):
+    """Set all random seeds for reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def get_git_hash():
+    """Retrieve the current Git commit hash."""
+    try:
+        return subprocess.check_output(["git", "rev-parse", "HEAD"]).decode("utf-8").strip()
+    except Exception:
+        return "not-a-git-repo"
+
+
+def save_metadata(run_dir, run_num, seed):
+    """Save exact seed, hardware config, and commit hash to metadata.json."""
+    metadata = {
+        "run": run_num,
+        "seed": seed,
+        "git_commit_hash": get_git_hash(),
+        "hardware": {
+            "device": str(device),
+            "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "None",
+            "cpu": platform.processor() or platform.machine(),
+            "os": platform.platform(),
+            "pytorch_version": torch.__version__,
+        }
+    }
+    meta_path = os.path.join(run_dir, "metadata.json")
+    with open(meta_path, "w") as f:
+        json.dump(metadata, f, indent=4)
 
 
 def log_history(path, row):
@@ -41,12 +81,13 @@ def get_next_run_dir(base_dir="results", prefix="rv_fft_run"):
     return run_dir, next_num
 
 
-def save_run_summary(run_dir, run_num, epoch_times, extra_metrics=None):
+def save_run_summary(run_dir, run_num, seed, epoch_times, extra_metrics=None):
     """Save average epoch time and run metadata to summary.csv."""
     avg_time = sum(epoch_times) / len(epoch_times) if epoch_times else 0.0
     summary_path = os.path.join(run_dir, "summary.csv")
     row = {
         "run": run_num,
+        "seed": seed,
         "num_epochs": len(epoch_times),
         "avg_epoch_time_sec": round(avg_time, 4),
         "total_time_sec": round(sum(epoch_times), 4),
@@ -54,12 +95,11 @@ def save_run_summary(run_dir, run_num, epoch_times, extra_metrics=None):
     if extra_metrics:
         row.update(extra_metrics)
     log_history(summary_path, row)
-    print(f"Run {run_num} complete | Avg epoch time: {avg_time:.4f}s | Saved to {run_dir}")
+    print(f"Run {run_num} (Seed {seed}) complete | Avg epoch time: {avg_time:.4f}s | Saved to {run_dir}")
 
 
 def to_centered_fft_channels(x):
     """Convert (N, 1, H, W) real images into (N, 2, H, W) centered 2D FFT [real, imag]."""
-    # Compute 2D FFT over spatial dims and shift zero-frequency component to center
     fft_c = torch.fft.fftshift(torch.fft.fft2(x.squeeze(1)), dim=(-2, -1))
     return torch.stack([fft_c.real, fft_c.imag], dim=1).to(torch.float32)
 
@@ -116,9 +156,8 @@ def evaluate(model, X, y, batch_size=128):
     return total_loss / (len(X) * y.shape[1])
 
 
-def train_model(model, train_X, train_y, val_X, val_y, epochs, lr,
-                batch_size=64, save_dir="saved_models/lens_rv_fft"):
-    os.makedirs(save_dir, exist_ok=True)
+def train_model(model, train_X, train_y, val_X, val_y, epochs, lr, seed,
+                batch_size=64, base_save_dir="saved_models/lens_rv_fft"):
     model = model.to(device)
     optimizer = optim.Adam(model.parameters(), lr=lr)
     criterion = nn.MSELoss()
@@ -128,9 +167,17 @@ def train_model(model, train_X, train_y, val_X, val_y, epochs, lr,
 
     # Create a new numbered folder for this run (e.g., results/rv_fft_run_1)
     run_dir, run_num = get_next_run_dir(base_dir="results", prefix="rv_fft_run")
+    
+    # Save metadata.json immediately to verify seed, hardware, and git commit
+    save_metadata(run_dir, run_num, seed)
+
+    # Isolate model checkpoints per run/seed so trials don't overwrite each other
+    save_dir = os.path.join(base_save_dir, f"run_{run_num}_seed_{seed}")
+    os.makedirs(save_dir, exist_ok=True)
+
     history_path = os.path.join(run_dir, "loss_history.csv")
     epoch_times = []
-    print(f"Starting Run {run_num} -> saving outputs to {run_dir}")
+    print(f"\nStarting Run {run_num} (Seed {seed}) -> saving outputs to {run_dir}")
 
     for epoch in range(epochs):
         model.train()
@@ -161,7 +208,7 @@ def train_model(model, train_X, train_y, val_X, val_y, epochs, lr,
         epoch_duration = time.perf_counter() - t0
         epoch_times.append(epoch_duration)
 
-        print(f"Epoch {epoch+1}/{epochs} ({epoch_duration:.1f}s) "
+        print(f"[Seed {seed}] Epoch {epoch+1}/{epochs} ({epoch_duration:.1f}s) "
               f"train_loss={train_loss:.4e} val_loss={val_loss:.4e}")
 
         log_history(history_path, {
@@ -177,8 +224,7 @@ def train_model(model, train_X, train_y, val_X, val_y, epochs, lr,
             torch.save(model, fname)
             print(f"  Saved new best model: {fname}")
 
-    # Save average epoch runtime after all epochs finish
-    save_run_summary(run_dir, run_num, epoch_times, extra_metrics={"best_val_loss": best_vloss})
+    save_run_summary(run_dir, run_num, seed, epoch_times, extra_metrics={"best_val_loss": best_vloss})
 
 
 if __name__ == "__main__":
@@ -188,14 +234,24 @@ if __name__ == "__main__":
     val_X_raw = torch.from_numpy(np.load(os.path.join(DATA_DIR, "val_X.npy"))).to(torch.float32)
     val_y = torch.from_numpy(np.load(os.path.join(DATA_DIR, "val_y.npy"))).to(torch.float32)
 
-    # Convert pixel images to centered 2D FFT (Real, Imag) channels
     train_X = to_centered_fft_channels(train_X_raw)
     val_X = to_centered_fft_channels(val_X_raw)
-
     print("train_X FFT shape:", train_X.shape, "val_X FFT shape:", val_X.shape)
 
-    model = GravLensRealFFTCNN(in_channels=2)
-    print("Model has", sum(p.numel() for p in model.parameters() if p.requires_grad), "trainable parameters.")
+    SEEDS = [42, 123, 456, 789]
+
+    for seed in SEEDS:
+        # 1. Set the seed BEFORE initializing the model so weights start differently
+        set_seed(seed)
+
+        # 2. Initialize a fresh model from scratch for every trial
+        model = GravLensRealFFTCNN(in_channels=2)
+        if seed == SEEDS[0]:
+            print("Model has", sum(p.numel() for p in model.parameters() if p.requires_grad), "trainable parameters.")
+
+        # 3. Run training
+        train_model(model, train_X, train_y, val_X, val_y, epochs=500, lr=0.001, seed=seed)
+
 
     train_model(model, train_X, train_y, val_X, val_y, epochs=500, lr=0.001)
 
