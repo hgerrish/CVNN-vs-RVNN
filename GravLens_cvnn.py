@@ -280,7 +280,7 @@ def evaluate(model, X, y, batch_size=128):
             yb = y[i:i + batch_size].to(device)
             pred = model(xb)
             total_loss += criterion(pred, yb).item()
-    return total_loss / (len(X) * y.shape)
+    return total_loss / (len(X) * y.numel())
 
 
 def train_model(model, train_X, train_y, val_X, val_y, epochs, lr, seed,
