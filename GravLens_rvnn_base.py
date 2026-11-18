@@ -217,7 +217,7 @@ if __name__ == "__main__":
 
     print("train_X shape:", train_X.shape, "val_X shape:", val_X.shape)
 
-    SEEDS = [42, 123, 456, 789]
+    SEEDS = [42, 123, 456, 789, 1024]
 
     for seed in SEEDS:
         # 1. Set the seed BEFORE initializing the model
