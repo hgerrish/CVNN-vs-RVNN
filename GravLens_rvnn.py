@@ -238,7 +238,7 @@ if __name__ == "__main__":
     val_X = to_centered_fft_channels(val_X_raw)
     print("train_X FFT shape:", train_X.shape, "val_X FFT shape:", val_X.shape)
 
-    SEEDS = [42, 123, 456, 789]
+    SEEDS = [42, 123, 456, 789, 1024]
 
     for seed in SEEDS:
         # 1. Set the seed BEFORE initializing the model so weights start differently
