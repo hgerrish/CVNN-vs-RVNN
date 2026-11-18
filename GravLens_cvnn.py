@@ -367,7 +367,7 @@ if __name__ == "__main__":
     val_X = to_centered_complex_fft(val_X_raw)
     print("train_X complex FFT shape:", train_X.shape, "val_X complex FFT shape:", val_X.shape)
 
-    SEEDS =
+    SEEDS = [42, 123, 456, 789, 1024]
 
     for seed in SEEDS:
         set_seed(seed)
